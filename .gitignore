@@ -1,0 +1,16 @@
+# general
+.DS_Store
+*.log
+
+# env
+.env
+
+# node/bun
+node_modules/
+bun.lockb
+bun.lock
+
+# TS build
+dist/
+build/
+*.tsbuildinfo
