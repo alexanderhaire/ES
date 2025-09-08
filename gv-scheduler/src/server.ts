@@ -1,225 +1,254 @@
-// src/server.ts
-import Fastify from "fastify";
-import { z } from "zod";
-import { google } from "googleapis";
-import { v4 as uuidv4 } from "uuid";
+import 'dotenv/config';
+import Fastify from 'fastify';
+import { z } from 'zod';
+import { google } from 'googleapis';
+import { v4 as uuidv4 } from 'uuid';
 
+// Environment validation
+const REQUIRED_ENV = [
+  'GOOGLE_CLIENT_ID',
+  'GOOGLE_CLIENT_SECRET',
+  'GOOGLE_REFRESH_TOKEN',
+  'GOOGLE_CALENDAR_ID',
+] as const;
 
-/**
- * Minimal Fastify server that schedules a Google Calendar event and emails the invite.
- * Env required:
- *   GOOGLE_CLIENT_ID
- *   GOOGLE_CLIENT_SECRET
- *   GOOGLE_REFRESH_TOKEN
- * Optional:
- *   PORT (default 4005)
- *   GOOGLE_CALENDAR_ID (default "primary")
- *   TZ (default "America/New_York")
- */
-
-const app = Fastify({ logger: true });
-
-const PORT = Number(process.env.PORT || 4005);
-const CAL_ID = process.env.GOOGLE_CALENDAR_ID || "primary";
-const DEFAULT_TZ = process.env.TZ || "America/New_York";
-
-function getOAuthClient() {
-  const client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    // Redirect URI not used here; refresh token already obtained
-    "http://localhost"
-  );
-  client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN });
-  return client;
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    throw new Error(`Environment variable ${key} is required`);
+  }
 }
 
-/* --------------------------- Request validation --------------------------- */
+const PORT = Number(process.env.PORT) || 4005;
+const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
+const DEFAULT_TIMEZONE = process.env.TZ || 'America/New_York';
 
-const ScheduleBody = z
-  .object({
-    email: z.string().email(),
-    label: z.string().optional(),                 // e.g. "Wednesday afternoon", "Tue 11am"
-    startIso: z.string().datetime().optional(),   // concrete start datetime
-    durationMin: z.number().int().min(15).max(240).optional().default(45),
-    tz: z.string().optional().default(DEFAULT_TZ),
-    createMeet: z.boolean().optional().default(true),
+// Google Calendar setup
+const oauth2Client = new google.auth.OAuth2(
+  process.env.GOOGLE_CLIENT_ID!,
+  process.env.GOOGLE_CLIENT_SECRET!
+);
+oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN! });
 
-    // Optional for idempotency/logging
-    roomId: z.string().optional(),
-    agentId: z.string().optional(),
-    externalKey: z.string().optional(),
-  })
-  .refine(
-    (b) => Boolean(b.label) || Boolean(b.startIso),
-    { message: "Provide either 'label' or 'startIso'." }
-  );
+const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-/* ------------------------------ Label parsing ----------------------------- */
+// Fastify server initialization
+const app = Fastify({ logger: true });
 
+// Request validation schema
+const ScheduleRequestSchema = z.object({
+  email: z.string().email('Invalid email address'),
+  label: z.string().optional().describe('e.g., "Monday 1pm"'),
+  startIso: z.string().datetime('Invalid ISO datetime').optional(),
+  durationMin: z.number().int().min(15).max(240).optional().default(45),
+  tz: z.string().optional().default(DEFAULT_TIMEZONE),
+  createMeet: z.boolean().optional().default(true),
+  roomId: z.string().optional(),
+  agentId: z.string().optional(),
+  externalKey: z.string().optional(),
+}).refine(data => data.label || data.startIso, {
+  message: 'Either "label" or "startIso" must be provided',
+});
+
+// Label parsing utility
 function parseLabel(label?: string): { day: string | null; timeText: string | null } {
   if (!label) return { day: null, timeText: null };
-  const t = label.trim();
 
-  // Extract first token as potential weekday
-  let [first, ...rest] = t.split(/\s+/);
+  const dayRegex = new RegExp(
+    '(sun|mon|tue|wed|thu|fri|sat|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
+    'i'
+  );
+  const timeRegex = /(\d{1,2})(:(\d{2}))?\s*(am|pm)?/i;
 
-  const day =
-    /^sun/i.test(first) ? "Sunday" :
-    /^mon/i.test(first) ? "Monday" :
-    /^tue/i.test(first) ? "Tuesday" :
-    /^wed/i.test(first) ? "Wednesday" :
-    /^thu/i.test(first) ? "Thursday" :
-    /^fri/i.test(first) ? "Friday" :
-    /^sat/i.test(first) ? "Saturday" : null;
+  const dayMatch = label.match(dayRegex);
+  if (!dayMatch) return { day: null, timeText: null };
 
-  let timeText = rest.join(" ").trim();
+  let day = dayMatch[0].charAt(0).toUpperCase() + dayMatch[0].slice(1).toLowerCase();
+  const dayMap: Record<string, string> = {
+    Sun: 'Sunday', Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday',
+    Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday',
+  };
+  day = dayMap[day] || day;
 
-  // Friendly words → times
-  if (/afternoon/i.test(timeText)) timeText = "3:00 PM";
-  else if (/morning/i.test(timeText)) timeText = "10:00 AM";
-  // 3pm → 3:00 PM
-  else if (/^(\d{1,2})(am|pm)$/i.test(timeText)) {
-    const m = timeText.match(/^(\d{1,2})(am|pm)$/i)!;
-    timeText = `${m[1]}:00 ${m[2].toUpperCase()}`;
+  const start = dayMatch.index! + dayMatch[0].length;
+  const after = label.slice(start);
+  const timeMatch = after.match(timeRegex);
+
+  let timeText = timeMatch
+    ? `${timeMatch[1]}:${timeMatch[3] || '00'} ${timeMatch[4] || ''}`.trim()
+    : null;
+
+  if (timeText) {
+    if (/^(\d{1,2})(am|pm)$/i.test(timeText)) {
+      const m = /^(\d{1,2})(am|pm)$/i.exec(timeText)!;
+      timeText = `${m[1]}:00 ${m[2].toUpperCase()}`;
+    } else if (/^(\d{1,2}):(\d{2})\s*(am|pm)$/i.test(timeText)) {
+      const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(timeText)!;
+      timeText = `${m[1]}:${m[2]} ${m[3].toUpperCase()}`;
+    }
   }
-  // 3:30 pm → 3:30 PM
-  else if (/^(\d{1,2}):(\d{2})\s*(am|pm)$/i.test(timeText)) {
-    const m = timeText.match(/^(\d{1,2}):(\d{2})\s*(am|pm)$/i)!;
-    timeText = `${m[1]}:${m[2]} ${m[3].toUpperCase()}`;
-  }
 
-  if (!timeText) timeText = null;
+  if (/afternoon/i.test(label)) timeText = '3:00 PM';
+  else if (/morning/i.test(label)) timeText = '10:00 AM';
+  if (!timeText) timeText = '10:00 AM';
+
   return { day, timeText };
 }
 
+// Calculate next occurrence
 function nextOccurrence(day: string, timeText: string): Date {
-  // Convert weekday to 0..6 (Sun..Sat)
-  const dow =
-    day === "Sunday" ? 0 :
-    day === "Monday" ? 1 :
-    day === "Tuesday" ? 2 :
-    day === "Wednesday" ? 3 :
-    day === "Thursday" ? 4 :
-    day === "Friday" ? 5 : 6; // Saturday
+  const dowMap: Record<string, number> = {
+    Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3, Thursday: 4,
+    Friday: 5, Saturday: 6,
+  };
+  const dow = dowMap[day] ?? 0;
 
   const now = new Date();
-  const d = new Date(now);
-  let delta = dow - d.getDay();
-  if (delta <= 0) delta += 7; // next week if today has passed
-  d.setDate(d.getDate() + delta);
+  const target = new Date(now);
+  let delta = dow - target.getDay();
+  if (delta <= 0) delta += 7; // Next week if past today
+  target.setDate(target.getDate() + delta);
 
-  // Parse "H:MM AM/PM"
-  const m = timeText.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i) || ["", "10", "00", "AM"];
-  let hh = parseInt(m[1], 10);
-  const mm = parseInt(m[2], 10);
-  const ap = m[3].toUpperCase();
-  if (ap === "PM" && hh !== 12) hh += 12;
-  if (ap === "AM" && hh === 12) hh = 0;
+  const [time, period] = timeText.split(/\s+/);
+  const [hh, mm = '00'] = time.split(':');
+  let hour = parseInt(hh, 10);
+  if (period?.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+  if (period?.toUpperCase() === 'AM' && hour === 12) hour = 0;
 
-  d.setHours(hh, mm, 0, 0);
-  return d;
+  target.setHours(hour, parseInt(mm, 10), 0, 0);
+  return target;
 }
 
-function formatWhenText(d: Date, tz: string) {
-  const day = new Intl.DateTimeFormat(undefined, { weekday: "long", timeZone: tz }).format(d);
-  const time = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit", timeZone: tz }).format(d);
-  return `${day} at ${time} ${tz}`;
+// Format event time
+function formatWhenText(date: Date, tz: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    weekday: 'long',
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: tz,
+  }).format(date);
 }
 
-/* --------------------------- Dev idempotency set -------------------------- */
+// Idempotency set
+const seenKeys = new Set<string>();
 
-const seen = new Set<string>();
+// Routes
+app.get('/health', async (req, reply) => {
+  reply.send({ ok: true });
+});
 
-/* --------------------------------- Routes -------------------------------- */
-
-app.get("/health", async () => ({ ok: true }));
-
-app.post("/schedule", async (req, reply) => {
-  const parsed = ScheduleBody.safeParse(req.body);
+app.post('/schedule', async (req, reply) => {
+  const parsed = ScheduleRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    return reply.code(400).send({ ok: false, error: parsed.error.flatten() });
+    return reply.status(400).send({ ok: false, error: parsed.error.errors });
   }
-  const b = parsed.data;
+
+  const {
+    email,
+    label,
+    startIso,
+    durationMin,
+    tz,
+    createMeet,
+    roomId,
+    agentId,
+    externalKey,
+  } = parsed.data;
 
   // Determine start time
   let start: Date;
-  if (b.startIso) {
-    start = new Date(b.startIso);
+  if (startIso) {
+    start = new Date(startIso);
   } else {
-    const { day, timeText } = parseLabel(b.label);
+    const { day, timeText } = parseLabel(label);
     if (!day) {
-      return reply.code(400).send({
+      return reply.status(400).send({
         ok: false,
-        error: "label must include a weekday (e.g., 'Wednesday', 'Tue').",
+        error: 'Label must include a weekday (e.g., "Wednesday", "Tue").',
       });
     }
-    start = nextOccurrence(day, timeText || "10:00 AM");
+    start = nextOccurrence(day, timeText!);
   }
-  const end = new Date(start.getTime() + b.durationMin * 60 * 1000);
+  const end = new Date(start.getTime() + durationMin * 60 * 1000);
 
-  // Simple idempotency for dev
-  const idemKey = b.externalKey ?? `${b.roomId ?? ""}|${start.toISOString()}`;
-  if (idemKey && seen.has(idemKey)) {
-    return reply.code(409).send({ ok: false, error: "duplicate", whenText: formatWhenText(start, b.tz) });
-  }
-  if (idemKey) seen.add(idemKey);
-
+  // Check for conflicts
   try {
-    const calendar = google.calendar({ version: "v3", auth: getOAuthClient() });
+    const response = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: start.toISOString(),
+      timeMax: end.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+    if (response.data.items?.length) {
+      req.log.warn({ start: start.toISOString(), conflicts: response.data.items.length }, 'Calendar conflict');
+      return reply.status(409).send({
+        ok: false,
+        error: 'time_conflict',
+        conflicts: response.data.items.map((e) => e.summary),
+      });
+    }
+  } catch (err) {
+    req.log.error({ err }, 'Failed to check calendar availability');
+    return reply.status(500).send({ ok: false, error: 'availability_check_failed' });
+  }
 
-    const event: any = {
-      summary: "Grand Villa Tour",
-      description:
-        "Thanks for scheduling a visit to Grand Villa. This invite includes time, location, and directions.",
-      location: "Grand Villa",
-      start: { dateTime: start.toISOString(), timeZone: b.tz },
-      end:   { dateTime: end.toISOString(),   timeZone: b.tz },
+  // Idempotency check
+  const idempKey = externalKey ?? `${roomId ?? ''}|${start.toISOString()}`;
+  if (idempKey && seenKeys.has(idempKey)) {
+    return reply.status(409).send({
+      ok: false,
+      error: 'duplicate',
+      whenText: formatWhenText(start, tz),
+    });
+  }
+  if (idempKey) seenKeys.add(idempKey);
 
-      // IMPORTANT: guests + sendUpdates -> Google emails the invitation
-      attendees: [{ email: b.email }],
-
+  // Create calendar event
+  try {
+    const event = {
+      summary: 'Grand Villa Tour',
+      description: 'Thank you for scheduling a visit to Grand Villa. This invite includes time, location, and directions.',
+      location: 'Grand Villa',
+      start: { dateTime: start.toISOString(), timeZone: tz },
+      end: { dateTime: end.toISOString(), timeZone: tz },
+      attendees: [{ email }],
       reminders: { useDefault: true },
       guestsCanSeeOtherGuests: false,
       guestsCanInviteOthers: false,
-
-      // For your logging/dedupe
-      extendedProperties: { private: { externalKey: idemKey } },
+      extendedProperties: { private: { externalKey: idempKey } },
     };
 
-    if (b.createMeet) {
+    if (createMeet) {
       event.conferenceData = {
-        createRequest: {
-          requestId: uuidv4(),
-          conferenceSolutionKey: { type: "hangoutsMeet" },
-        },
+        createRequest: { requestId: uuidv4(), conferenceSolutionKey: { type: 'hangoutsMeet' } },
       };
     }
 
-    const { data } = await calendar.events.insert({
-      calendarId: CAL_ID,
+    const response = await calendar.events.insert({
+      calendarId: CALENDAR_ID,
       requestBody: event,
-      sendUpdates: "all",            // <— emails guests
-      conferenceDataVersion: 1,      // <— needed when using conferenceData
+      sendUpdates: 'all',
+      conferenceDataVersion: createMeet ? 1 : 0,
     });
 
-    const whenText = formatWhenText(start, b.tz);
-    req.log.info({ eventId: data.id, htmlLink: data.htmlLink, whenText }, "Calendar invite created");
-
+    const whenText = formatWhenText(start, tz);
+    req.log.info({ eventId: response.data.id, htmlLink: response.data.htmlLink, whenText }, 'Event created');
     return reply.send({
       ok: true,
-      eventId: data.id,
-      htmlLink: data.htmlLink,
+      eventId: response.data.id,
+      htmlLink: response.data.htmlLink,
       whenText,
     });
-  } catch (err: any) {
-    req.log.error({ err: err?.response?.data ?? err }, "Calendar insert failed");
-    return reply.code(500).send({ ok: false, error: err?.message ?? "calendar_error" });
+  } catch (err) {
+    req.log.error({ err: err?.response?.data ?? err }, 'Failed to create calendar event');
+    return reply.status(500).send({ ok: false, error: err?.message ?? 'event_creation_failed' });
   }
 });
 
-/* ------------------------------ Server start ------------------------------ */
-
-app.listen({ host: "0.0.0.0", port: PORT }).then(() => {
-  app.log.info(`Server listening on http://127.0.0.1:${PORT}`);
-});
+// Server start
+app.listen({ host: '0.0.0.0', port: PORT })
+  .then(() => app.log.info(`Server listening on http://127.0.0.1:${PORT} and http://192.168.1.245:${PORT}`))
+  .catch((err) => {
+    app.log.error(err, 'Server failed to start');
+    process.exit(1);
+  });

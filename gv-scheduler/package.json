@@ -8,6 +8,8 @@
     "start": "tsx src/server.ts",
     "worker": "tsx src/workers/visit-worker.ts",
     "worker:watch": "tsx watch src/workers/visit-worker.ts",
+    "seeder": "tsx src/workers/discovery-seeder.ts",
+    "seeder:watch": "tsx watch src/workers/discovery-seeder.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
