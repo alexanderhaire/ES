@@ -4,6 +4,7 @@ import { z } from "zod";
 import { google } from "googleapis";
 import { v4 as uuidv4 } from "uuid";
 
+
 /**
  * Minimal Fastify server that schedules a Google Calendar event and emails the invite.
  * Env required:

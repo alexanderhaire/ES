@@ -1,8 +1,26 @@
 {
+  "name": "gv-scheduler",
+  "version": "0.1.0",
+  "private": true,
   "type": "module",
   "scripts": {
-    "dev": "bun --hot src/server.ts",
-    "start": "bun src/server.ts"
+    "dev": "tsx src/server.ts",
+    "start": "tsx src/server.ts",
+    "worker": "tsx src/workers/visit-worker.ts",
+    "worker:watch": "tsx watch src/workers/visit-worker.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.2",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.0",
+    "@types/node": "^20.11.30"
+  },
+  "engines": {
+    "node": ">=18",
+    "bun": ">=1.0.0"
   }
 }
-
