@@ -1,145 +1,141 @@
+// src/server.ts
 import 'dotenv/config';
 import Fastify from 'fastify';
 import { z } from 'zod';
 import { google } from 'googleapis';
+import { DateTime } from 'luxon';
+import * as chrono from 'chrono-node';
 import { v4 as uuidv4 } from 'uuid';
 
-// Environment validation
-const REQUIRED_ENV = [
-  'GOOGLE_CLIENT_ID',
-  'GOOGLE_CLIENT_SECRET',
-  'GOOGLE_REFRESH_TOKEN',
-  'GOOGLE_CALENDAR_ID',
-] as const;
-
+/* =========================
+   Env & constants
+========================= */
+const REQUIRED_ENV = ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET', 'GOOGLE_REFRESH_TOKEN'] as const;
 for (const key of REQUIRED_ENV) {
-  if (!process.env[key]) {
-    throw new Error(`Environment variable ${key} is required`);
-  }
+  if (!process.env[key]) throw new Error(`Environment variable ${key} is required`);
 }
 
 const PORT = Number(process.env.PORT) || 4005;
 const CALENDAR_ID = process.env.GOOGLE_CALENDAR_ID || 'primary';
-const DEFAULT_TIMEZONE = process.env.TZ || 'America/New_York';
+const DEFAULT_TZ = process.env.TZ || 'America/New_York';
 
-// Google Calendar setup
-const oauth2Client = new google.auth.OAuth2(
+/* =========================
+   Google Calendar client
+========================= */
+const oauth2 = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID!,
   process.env.GOOGLE_CLIENT_SECRET!
 );
-oauth2Client.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN! });
+// Refresh-token flow; no redirect URI needed here
+oauth2.setCredentials({ refresh_token: process.env.GOOGLE_REFRESH_TOKEN! });
 
-const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+const calendar = google.calendar({ version: 'v3', auth: oauth2 });
 
-// Fastify server initialization
-const app = Fastify({ logger: true });
+/* =========================
+   Validation
+========================= */
+const ScheduleRequestSchema = z
+  .object({
+    email: z.string().email(),
+    label: z.string().optional(),               // e.g. "Friday 9am"
+    startIso: z.string().datetime().optional(), // if provided, label is optional
+    durationMin: z.number().int().min(15).max(240).optional().default(60),
+    tz: z.string().optional().default(DEFAULT_TZ),
+    createMeet: z.boolean().optional().default(true),
+    roomId: z.string().optional(),
+    agentId: z.string().optional(),
+    externalKey: z.string().optional(),
+    summary: z.string().optional().default('Grand Villa Tour'),
+    location: z.string().optional().default('Grand Villa of Clearwater'),
+    description: z
+      .string()
+      .optional()
+      .default('Thank you for scheduling a visit to Grand Villa. This invite includes time, location, and directions.'),
+  })
+  .refine((d) => d.label || d.startIso, { message: 'Either "label" or "startIso" must be provided' });
 
-// Request validation schema
-const ScheduleRequestSchema = z.object({
-  email: z.string().email('Invalid email address'),
-  label: z.string().optional().describe('e.g., "Monday 1pm"'),
-  startIso: z.string().datetime('Invalid ISO datetime').optional(),
-  durationMin: z.number().int().min(15).max(240).optional().default(45),
-  tz: z.string().optional().default(DEFAULT_TIMEZONE),
-  createMeet: z.boolean().optional().default(true),
-  roomId: z.string().optional(),
-  agentId: z.string().optional(),
-  externalKey: z.string().optional(),
-}).refine(data => data.label || data.startIso, {
-  message: 'Either "label" or "startIso" must be provided',
-});
+/* =========================
+   Helpers
+========================= */
+function formatWhenText(dt: DateTime): string {
+  return dt.toFormat("EEEE 'at' h:mm a");
+}
 
-// Label parsing utility
-function parseLabel(label?: string): { day: string | null; timeText: string | null } {
-  if (!label) return { day: null, timeText: null };
+function parseWithChrono(label: string, tz: string): DateTime | undefined {
+  try {
+    // forwardDate nudges ambiguous times to the future
+    const parsed: Date | null = chrono.parseDate(label, new Date(), { forwardDate: true } as any);
+    if (!parsed) return undefined;
+    // Keep the intended wall-clock time in target tz
+    return DateTime.fromJSDate(parsed).setZone(tz, { keepLocalTime: true });
+  } catch {
+    return undefined;
+  }
+}
 
-  const dayRegex = new RegExp(
-    '(sun|mon|tue|wed|thu|fri|sat|monday|tuesday|wednesday|thursday|friday|saturday|sunday)',
-    'i'
-  );
-  const timeRegex = /(\d{1,2})(:(\d{2}))?\s*(am|pm)?/i;
+function parseLabelFallback(label: string, tz: string): DateTime | undefined {
+  const dayRegex =
+    /(sun|mon|tue|wed|thu|fri|sat|sunday|monday|tuesday|wednesday|thursday|friday|saturday)/i;
+  const timeRegex = /(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i;
 
-  const dayMatch = label.match(dayRegex);
-  if (!dayMatch) return { day: null, timeText: null };
+  const m = label.match(dayRegex);
+  if (!m) return undefined;
 
-  let day = dayMatch[0].charAt(0).toUpperCase() + dayMatch[0].slice(1).toLowerCase();
-  const dayMap: Record<string, string> = {
-    Sun: 'Sunday', Mon: 'Monday', Tue: 'Tuesday', Wed: 'Wednesday',
-    Thu: 'Thursday', Fri: 'Friday', Sat: 'Saturday',
+  const map: Record<string, number> = {
+    sun: 7, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+    sunday: 7, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
   };
-  day = dayMap[day] || day;
+  const targetDow = map[m[0].toLowerCase()];
+  if (!targetDow) return undefined;
 
-  const start = dayMatch.index! + dayMatch[0].length;
-  const after = label.slice(start);
-  const timeMatch = after.match(timeRegex);
+  let hour = /afternoon/i.test(label) ? 15 : /morning/i.test(label) ? 10 : 10;
+  let minute = 0;
 
-  let timeText = timeMatch
-    ? `${timeMatch[1]}:${timeMatch[3] || '00'} ${timeMatch[4] || ''}`.trim()
-    : null;
-
-  if (timeText) {
-    if (/^(\d{1,2})(am|pm)$/i.test(timeText)) {
-      const m = /^(\d{1,2})(am|pm)$/i.exec(timeText)!;
-      timeText = `${m[1]}:00 ${m[2].toUpperCase()}`;
-    } else if (/^(\d{1,2}):(\d{2})\s*(am|pm)$/i.test(timeText)) {
-      const m = /^(\d{1,2}):(\d{2})\s*(am|pm)$/i.exec(timeText)!;
-      timeText = `${m[1]}:${m[2]} ${m[3].toUpperCase()}`;
-    }
+  const after = label.slice((m.index ?? 0) + m[0].length);
+  const t = after.match(timeRegex);
+  if (t) {
+    let h = parseInt(t[1], 10);
+    const mm = t[2] ? parseInt(t[2], 10) : 0;
+    const ap = t[3]?.toUpperCase();
+    if (ap === 'PM' && h !== 12) h += 12;
+    if (ap === 'AM' && h === 12) h = 0;
+    hour = h;
+    minute = mm;
   }
 
-  if (/afternoon/i.test(label)) timeText = '3:00 PM';
-  else if (/morning/i.test(label)) timeText = '10:00 AM';
-  if (!timeText) timeText = '10:00 AM';
+  const now = DateTime.now().setZone(tz);
+  let dt = now.set({ hour, minute, second: 0, millisecond: 0 });
+  let delta = targetDow - now.weekday; // weekday: 1..7 (Mon..Sun)
+  if (delta < 0) delta += 7;
+  if (delta === 0 && dt <= now) delta = 7; // same-day but time passed -> next week
+  dt = dt.plus({ days: delta });
 
-  return { day, timeText };
+  return dt.isValid ? dt : undefined;
 }
 
-// Calculate next occurrence
-function nextOccurrence(day: string, timeText: string): Date {
-  const dowMap: Record<string, number> = {
-    Sunday: 0, Monday: 1, Tuesday: 2, Wednesday: 3, Thursday: 4,
-    Friday: 5, Saturday: 6,
+function buildEventTimes(start: DateTime, durationMin: number) {
+  const end = start.plus({ minutes: durationMin });
+  const fmt = "yyyy-LL-dd'T'HH:mm:ss"; // local wall clock (no 'Z')
+  return {
+    startDateTime: start.toFormat(fmt),
+    endDateTime: end.toFormat(fmt),
+    end,
   };
-  const dow = dowMap[day] ?? 0;
-
-  const now = new Date();
-  const target = new Date(now);
-  let delta = dow - target.getDay();
-  if (delta <= 0) delta += 7; // Next week if past today
-  target.setDate(target.getDate() + delta);
-
-  const [time, period] = timeText.split(/\s+/);
-  const [hh, mm = '00'] = time.split(':');
-  let hour = parseInt(hh, 10);
-  if (period?.toUpperCase() === 'PM' && hour !== 12) hour += 12;
-  if (period?.toUpperCase() === 'AM' && hour === 12) hour = 0;
-
-  target.setHours(hour, parseInt(mm, 10), 0, 0);
-  return target;
 }
 
-// Format event time
-function formatWhenText(date: Date, tz: string): string {
-  return new Intl.DateTimeFormat('en-US', {
-    weekday: 'long',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZone: tz,
-  }).format(date);
-}
+/* =========================
+   Server
+========================= */
+const app = Fastify({ logger: true });
 
-// Idempotency set
-const seenKeys = new Set<string>();
-
-// Routes
-app.get('/health', async (req, reply) => {
-  reply.send({ ok: true });
+app.get('/health', async (_req, reply) => {
+  reply.send({ ok: true, tz: DEFAULT_TZ, calendarId: CALENDAR_ID });
 });
 
 app.post('/schedule', async (req, reply) => {
   const parsed = ScheduleRequestSchema.safeParse(req.body);
   if (!parsed.success) {
-    return reply.status(400).send({ ok: false, error: parsed.error.errors });
+    return reply.status(400).send({ ok: false, error: parsed.error.flatten() });
   }
 
   const {
@@ -152,102 +148,124 @@ app.post('/schedule', async (req, reply) => {
     roomId,
     agentId,
     externalKey,
+    summary,
+    location,
+    description,
   } = parsed.data;
 
-  // Determine start time
-  let start: Date;
-  if (startIso) {
-    start = new Date(startIso);
-  } else {
-    const { day, timeText } = parseLabel(label);
-    if (!day) {
-      return reply.status(400).send({
-        ok: false,
-        error: 'Label must include a weekday (e.g., "Wednesday", "Tue").',
-      });
-    }
-    start = nextOccurrence(day, timeText!);
-  }
-  const end = new Date(start.getTime() + durationMin * 60 * 1000);
-
-  // Check for conflicts
   try {
-    const response = await calendar.events.list({
-      calendarId: CALENDAR_ID,
-      timeMin: start.toISOString(),
-      timeMax: end.toISOString(),
-      singleEvents: true,
-      orderBy: 'startTime',
-    });
-    if (response.data.items?.length) {
-      req.log.warn({ start: start.toISOString(), conflicts: response.data.items.length }, 'Calendar conflict');
-      return reply.status(409).send({
-        ok: false,
-        error: 'time_conflict',
-        conflicts: response.data.items.map((e) => e.summary),
-      });
+    // 1) Resolve start time in target tz
+    let startDt: DateTime | undefined;
+    if (startIso) {
+      startDt = DateTime.fromISO(startIso, { setZone: true }).setZone(tz);
+    } else if (label) {
+      startDt = parseWithChrono(label, tz) ?? parseLabelFallback(label, tz);
     }
-  } catch (err) {
-    req.log.error({ err }, 'Failed to check calendar availability');
-    return reply.status(500).send({ ok: false, error: 'availability_check_failed' });
-  }
+    if (!startDt || !startDt.isValid) {
+      return reply.status(400).send({ ok: false, error: 'Could not parse date/time' });
+    }
 
-  // Idempotency check
-  const idempKey = externalKey ?? `${roomId ?? ''}|${start.toISOString()}`;
-  if (idempKey && seenKeys.has(idempKey)) {
-    return reply.status(409).send({
-      ok: false,
-      error: 'duplicate',
-      whenText: formatWhenText(start, tz),
-    });
-  }
-  if (idempKey) seenKeys.add(idempKey);
+    const { startDateTime, endDateTime, end } = buildEventTimes(startDt, durationMin);
 
-  // Create calendar event
-  try {
-    const event = {
-      summary: 'Grand Villa Tour',
-      description: 'Thank you for scheduling a visit to Grand Villa. This invite includes time, location, and directions.',
-      location: 'Grand Villa',
-      start: { dateTime: start.toISOString(), timeZone: tz },
-      end: { dateTime: end.toISOString(), timeZone: tz },
+    // 2) Idempotency via extendedProperties.private
+    const idempKey = externalKey ?? `${roomId ?? ''}|${agentId ?? ''}|${startDateTime}|${tz}`;
+    if (idempKey) {
+      const dup = await calendar.events.list({
+        calendarId: CALENDAR_ID,
+        privateExtendedProperty: `externalKey=${idempKey}`,
+        maxResults: 1,
+        singleEvents: true,
+      });
+      if (dup.data.items?.length) {
+        req.log.warn({ idempKey }, 'Duplicate scheduling prevented');
+        return reply
+          .status(409)
+          .send({ ok: false, error: 'duplicate', whenText: formatWhenText(startDt), startIso: startDt.toISO() });
+      }
+    }
+
+    // 3) Conflict check — prefer freebusy, fallback to events.list if scope insufficient
+    let hasConflict = false;
+    try {
+      const fb = await calendar.freebusy.query({
+        requestBody: {
+          timeMin: startDt.toUTC().toISO(),
+          timeMax: end.toUTC().toISO(),
+          items: [{ id: CALENDAR_ID }],
+        },
+      });
+      const busy = fb.data.calendars?.[CALENDAR_ID]?.busy ?? [];
+      hasConflict = busy.length > 0;
+    } catch (e: any) {
+      const msg = e?.response?.data || e?.message || e;
+      req.log.warn({ err: msg }, 'freebusy.query failed — falling back to events.list');
+
+      const list = await calendar.events.list({
+        calendarId: CALENDAR_ID,
+        timeMin: startDt.toUTC().toISO(),
+        timeMax: end.toUTC().toISO(),
+        singleEvents: true,
+        orderBy: 'startTime',
+        maxResults: 1,
+      });
+      hasConflict = (list.data.items?.length ?? 0) > 0;
+    }
+
+    if (hasConflict) {
+      return reply.status(409).send({ ok: false, error: 'time_conflict' });
+    }
+
+    // 4) Create event (Google emails invite because of sendUpdates: 'all')
+    const requestBody: any = {
+      summary,
+      description,
+      location,
+      start: { dateTime: startDateTime, timeZone: tz },
+      end: { dateTime: endDateTime, timeZone: tz },
       attendees: [{ email }],
-      reminders: { useDefault: true },
       guestsCanSeeOtherGuests: false,
       guestsCanInviteOthers: false,
+      reminders: { useDefault: true },
       extendedProperties: { private: { externalKey: idempKey } },
     };
 
     if (createMeet) {
-      event.conferenceData = {
+      requestBody.conferenceData = {
         createRequest: { requestId: uuidv4(), conferenceSolutionKey: { type: 'hangoutsMeet' } },
       };
     }
 
-    const response = await calendar.events.insert({
+    const ins = await calendar.events.insert({
       calendarId: CALENDAR_ID,
-      requestBody: event,
+      requestBody,
       sendUpdates: 'all',
       conferenceDataVersion: createMeet ? 1 : 0,
     });
 
-    const whenText = formatWhenText(start, tz);
-    req.log.info({ eventId: response.data.id, htmlLink: response.data.htmlLink, whenText }, 'Event created');
+    const link = ins.data.htmlLink ?? '';
+    const whenText = formatWhenText(startDt);
+    req.log.info({ eventId: ins.data.id, htmlLink: link, whenText }, 'Event created');
+
     return reply.send({
       ok: true,
-      eventId: response.data.id,
-      htmlLink: response.data.htmlLink,
+      eventId: ins.data.id,
+      htmlLink: link,
       whenText,
+      startIso: startDt.toISO(),
     });
-  } catch (err) {
-    req.log.error({ err: err?.response?.data ?? err }, 'Failed to create calendar event');
-    return reply.status(500).send({ ok: false, error: err?.message ?? 'event_creation_failed' });
+  } catch (err: any) {
+    const e = err?.response?.data ?? err?.message ?? err;
+    req.log.error({ err: e }, 'Scheduling failed');
+    return reply.status(500).send({ ok: false, error: e });
   }
 });
 
-// Server start
-app.listen({ host: '0.0.0.0', port: PORT })
-  .then(() => app.log.info(`Server listening on http://127.0.0.1:${PORT} and http://192.168.1.245:${PORT}`))
+/* =========================
+   Start
+========================= */
+app
+  .listen({ host: '0.0.0.0', port: PORT })
+  .then(() => app.log.info(`Server listening on http://127.0.0.1:${PORT}`))
   .catch((err) => {
     app.log.error(err, 'Server failed to start');
     process.exit(1);
